@@ -9,15 +9,15 @@ It’s designed for both live triage **and** offline analysis from a mounted dis
 
 ## Quick Start
 
-# Clone the repo and run the script against the host system:
-  1. git clone https://github.com/sydlexxia/sequoia-forensic.git
-  2. cd sequoia-forensic
-  3. chmod +x sequoia_forensic.sh
-  4. ./sequoia_forensic.sh --out /tmp/case
+### Clone the repo and run the script against the host system:
+git clone https://github.com/sydlexxia/sequoia-forensic.git
+cd sequoia-forensic
+chmod +x sequoia_forensic.sh
+./sequoia_forensic.sh --out /tmp/case
 
 ## Usage
 
-  ./sequoia_forensic.sh --help      # for the latest options.  
+./sequoia_forensic.sh --help      # for the latest options.  
 
 
 ### Command-line Flags
@@ -28,7 +28,7 @@ It’s designed for both live triage **and** offline analysis from a mounted dis
 | `--no-image-ok`            | Skip disk imaging if no device selected. Collects logs/artifacts only.      |
 | `--image DEVICE`           | Force a specific device for imaging (e.g., `/dev/disk2`).                   |
 | `--fast`                   | Enable fast mode (limits deep scans, quicker results).                      |
-| `--since N[d|h]`           | Time window for logs/events (e.g., `48h`, `7d`, `30d`). Default: `7d`.      |
+| `--since N`                | Time window for logs/events (e.g., `48h`, `7d`, `30d`). Default: `7d`.      |
 | `--skip-logs`              | Bypass Unified Log plaintext extraction (still collects `.logarchive`).     |
 | `--ask-skip-logs`          | Prompt interactively to bypass Unified Log plaintext.                       |
 | `--encrypt METHOD:KEY`     | Supported: `age:/path/to/key.pub`, `gpg:ID`, `openssl:cert.pem`.            |
@@ -40,33 +40,41 @@ It’s designed for both live triage **and** offline analysis from a mounted dis
 ### Typical Workflows
 
 **Fast live triage (minimal impact, skips imaging):**
-  ./sequoia_forensic.sh --no-image-ok --fast --skip-logs --out ~/Desktop/case_fast
+
+./sequoia_forensic.sh --no-image-ok --fast --skip-logs --out ~/Desktop/case_fast
 
 **Full acquisition (disk image + logs, requires sudo):**
-  sudo ./sequoia_forensic.sh --out /cases/case001
+
+sudo ./sequoia_forensic.sh --out /cases/case001
 
 **Encrypted results with public key (age):**
-  ./sequoia_forensic.sh --no-image-ok --encrypt age:/path/to/pubkey.txt --out ~/cases/encase
+
+./sequoia_forensic.sh --no-image-ok --encrypt age:/path/to/pubkey.txt --out ~/cases/encase
 
 **Send results to Discord (lab/team triage):**
-  ./sequoia_forensic.sh --no-image-ok --webhook https://discord.com/api/webhooks/... --out ~/Desktop/case_discord
+
+./sequoia_forensic.sh --no-image-ok --webhook https://discord.com/api/webhooks/... --out ~/Desktop/case_discord
 
 
-## Common Options
+### Common Options
   --no-image-ok : Skip full disk imaging (just collect logs, processes, artifacts).
-  --since 7d    : Collect events from the last 7 days (supports 12h, 48h, 30d).
-  --skip-logs   : Bypass Unified Log plaintext extraction (still saves .logarchive).
-  --fast        : Faster scan mode (limits deep checks, still collects core data).
-  --encrypt age :/path/to/key.pub : Encrypt results with age, gpg, or openssl.
 
-# Example: Live triage with fast mode, skip logs
+  --since 7d    : Collect events from the last 7 days (supports 12h, 48h, 30d).
+
+  --skip-logs   : Bypass Unified Log plaintext extraction (still saves .logarchive).
+
+  --fast        : Faster scan mode (limits deep checks, still collects core data).
+
+  --encrypt age /path/to/key.pub : Encrypt results with age, gpg, or openssl.
+
+### Example: Live triage with fast mode, skip logs
   ./sequoia_forensic.sh --no-image-ok --fast --skip-logs --out ~/Desktop/forensics_case
 
-# Example: Full acquisition + image hashing
+### Example: Full acquisition + image hashing
   sudo ./sequoia_forensic.sh --out /cases/case001
 
-# All collected evidence and reports will be placed in the chosen --out directory.
-# At the end you’ll find:
+All collected evidence and reports will be placed in the chosen --out directory.
+At the end you’ll find:
   report.html (human-readable report)
   capabilities.json (machine-readable environment card)
   run_status.txt (receipt with start/end/exit code)
