@@ -23,7 +23,7 @@ FAST_MODE=false            # NEW: trims expensive steps
 ASK_BYPASS_LOGS=false   # prompt y/N at runtime if interactive
 SKIP_LOGS=false         # non-interactive full skip (CLI)
 RUN_STATUS="$OUTDIR/run_status.txt"
-echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUN_STATUS"
+#echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUN_STATUS"
 
 
 # Acquisition guard
@@ -47,6 +47,11 @@ ENCRYPTED_FILE=""
 # Debug / auth helpers
 DEBUG_MODE=false
 ASK_SUDO=false
+
+# Dashboard options
+DASHBOARD_MODE="none"  # none, tui, web, both
+DASHBOARD_PORT=8042
+DASHBOARD_PID=""
 
 # Unified log plaintext safety rails (bounded quick-view; full archive is kept)
 LOG_PLAIN_TIMEOUT=120      # seconds (reduced)
@@ -78,6 +83,10 @@ Encryption:
 
 Discord:
   --discord <webhook_url>    Upload (encrypted) zip to Discord webhook
+
+Dashboard:
+  --dashboard <mode>         Live visualization: tui, web, both, none (default: none)
+  --dashboard-port <port>    Web dashboard port (default: 8042)
 
 Advanced:
   --no-forensic              Disable acquisition-first guard
@@ -119,6 +128,9 @@ while [[ $# -gt 0 ]]; do
     --encrypt-pubkey) ENCRYPT_PUBKEY="$2"; shift 2;;
     --encrypt-method) ENCRYPT_METHOD="$2"; shift 2;;
 
+    --dashboard) DASHBOARD_MODE="$2"; shift 2;;
+    --dashboard-port) DASHBOARD_PORT="$2"; shift 2;;
+
     --debug) DEBUG_MODE=true; shift;;
     --ask-sudo) ASK_SUDO=true; shift;;
 
@@ -126,6 +138,35 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1"; usage;;
   esac
 done
+
+# -----------------------
+# Input validation & sanitization
+# -----------------------
+validate_path() {
+  local p="$1" type="$2"
+  # Check for path traversal attempts
+  case "$p" in
+    *../*|*/../*|*/..|../*)
+      echo "[error] Path traversal detected in $type: $p" >&2
+      exit 1
+      ;;
+  esac
+  # Ensure absolute path for critical parameters
+  if [[ "$type" == "root" || "$type" == "output" ]] && [[ "$p" != /* ]]; then
+    echo "[error] $type path must be absolute: $p" >&2
+    exit 1
+  fi
+  echo "$p"
+}
+
+# Validate critical paths
+ROOT="$(validate_path "$ROOT" "root")"
+OUTDIR="$(validate_path "$OUTDIR" "output")"
+[ -n "$IMAGE_DEV" ] && IMAGE_DEV="$(validate_path "$IMAGE_DEV" "image-device")"
+[ -n "$ENCRYPT_PUBKEY" ] && {
+  ENCRYPT_PUBKEY="$(validate_path "$ENCRYPT_PUBKEY" "encrypt-pubkey")"
+  [ ! -f "$ENCRYPT_PUBKEY" ] && echo "[error] Encryption key file not found: $ENCRYPT_PUBKEY" >&2 && exit 1
+}
 
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/collector.log"
@@ -173,6 +214,296 @@ exit_trap() {
 }
 trap debug_trap ERR
 trap exit_trap EXIT
+
+# -----------------------
+# Tool availability cache (optimization)
+# -----------------------
+declare -A HAS_TOOL
+for tool in ddrescue pv age gpg openssl praudit osqueryi rkhunter chkrootkit lsof pfctl log system_profiler sudo shasum sha256sum srm ionice; do
+  command -v "$tool" >/dev/null 2>&1 && HAS_TOOL[$tool]=1 || HAS_TOOL[$tool]=0
+done
+
+has_tool() { [ "${HAS_TOOL[$1]:-0}" -eq 1 ]; }
+
+# -----------------------
+# Dashboard System
+# -----------------------
+STATUS_JSON="$OUTDIR/dashboard_status.json"
+EVENT_LOG="$OUTDIR/dashboard_events.log"
+
+init_dashboard_status() {
+  cat > "$STATUS_JSON" <<'ENDJSON'
+{
+  "overall_progress": 0,
+  "current_step": 0,
+  "total_steps": 17,
+  "step_name": "Initializing",
+  "step_progress": 0,
+  "stats": {
+    "files_collected": 0,
+    "total_size_bytes": 0,
+    "elapsed_seconds": 0,
+    "artifacts_by_type": {}
+  },
+  "events": [],
+  "status": "running"
+}
+ENDJSON
+  : > "$EVENT_LOG"
+}
+
+update_dashboard() {
+  local key="$1" value="$2"
+  # Simple JSON update using Python if available, otherwise skip
+  if command -v /usr/bin/python3 >/dev/null 2>&1; then
+    /usr/bin/python3 - "$STATUS_JSON" "$key" "$value" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    path, key, value = sys.argv[1:4]
+    with open(path, 'r') as f:
+        data = json.load(f)
+    keys = key.split('.')
+    d = data
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    # Try to parse value as number
+    try:
+        d[keys[-1]] = int(value)
+    except ValueError:
+        try:
+            d[keys[-1]] = float(value)
+        except ValueError:
+            d[keys[-1]] = value
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+except Exception:
+    pass
+PY
+  fi
+}
+
+log_dashboard_event() {
+  local level="$1" message="$2"
+  local timestamp=$(date +"%H:%M:%S")
+  local icon="→"
+  case "$level" in
+    success) icon="✓";;
+    warning) icon="⚠";;
+    error) icon="✗";;
+  esac
+  echo "[$timestamp] $icon $message" >> "$EVENT_LOG"
+  # Keep only last 100 events
+  tail -n 100 "$EVENT_LOG" > "$EVENT_LOG.tmp" && mv "$EVENT_LOG.tmp" "$EVENT_LOG"
+}
+
+# TUI Dashboard Renderer
+start_tui_dashboard() {
+  (
+    # Run in subshell/background
+    exec >/dev/tty 2>&1
+    local refresh_rate=0.5
+
+    # Terminal setup
+    tput smcup 2>/dev/null || true  # Save screen
+    tput civis 2>/dev/null || true  # Hide cursor
+    trap 'tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; exit' EXIT INT TERM
+
+    while [ -f "$STATUS_JSON" ]; do
+      local term_height=$(tput lines 2>/dev/null || echo 24)
+      local term_width=$(tput cols 2>/dev/null || echo 80)
+
+      # Clear and reset
+      tput clear 2>/dev/null || clear
+      tput cup 0 0 2>/dev/null || true
+
+      # Read status
+      if command -v /usr/bin/python3 >/dev/null 2>&1 && [ -f "$STATUS_JSON" ]; then
+        local status_data=$(/usr/bin/python3 -c "import json; print(json.dumps(json.load(open('$STATUS_JSON'))))" 2>/dev/null || echo '{}')
+      else
+        local status_data='{}'
+      fi
+
+      # Header
+      echo "┌─ Sequoia Forensic - Live Collection Status $(date +'%H:%M:%S') ─┐"
+      echo "│                                                                  │"
+
+      # Overall progress bar
+      local overall_pct=$(echo "$status_data" | grep -o '"overall_progress":[0-9]*' | cut -d: -f2 || echo 0)
+      local current_step=$(echo "$status_data" | grep -o '"current_step":[0-9]*' | cut -d: -f2 || echo 0)
+      local total_steps=$(echo "$status_data" | grep -o '"total_steps":[0-9]*' | cut -d: -f2 || echo 17)
+      local filled=$((overall_pct * 50 / 100))
+      local empty=$((50 - filled))
+      printf "│ Overall: [%s%s] %3d%% (%d/%d)    │\n" \
+        "$(printf '█%.0s' $(seq 1 $filled 2>/dev/null || echo))" \
+        "$(printf '░%.0s' $(seq 1 $empty 2>/dev/null || echo))" \
+        "$overall_pct" "$current_step" "$total_steps"
+
+      echo "├──────────────────────────────────────────────────────────────────┤"
+
+      # Current step
+      local step_name=$(echo "$status_data" | grep -o '"step_name":"[^"]*"' | cut -d'"' -f4 || echo "Unknown")
+      echo "│ Current: $step_name"
+
+      # Stats section
+      echo "├──────────────────────────────────────────────────────────────────┤"
+      local files=$(echo "$status_data" | grep -o '"files_collected":[0-9]*' | cut -d: -f2 || echo 0)
+      local size_bytes=$(echo "$status_data" | grep -o '"total_size_bytes":[0-9]*' | cut -d: -f2 || echo 0)
+      local size_mb=$((size_bytes / 1048576))
+      printf "│ Files: %-10s  Size: %-10s                           │\n" "$files" "${size_mb}MB"
+
+      echo "├──────────────────────────────────────────────────────────────────┤"
+      echo "│ Recent Events:                                                   │"
+
+      # Recent events
+      if [ -f "$EVENT_LOG" ]; then
+        tail -n 5 "$EVENT_LOG" | while IFS= read -r line; do
+          printf "│ %-64s │\n" "${line:0:64}"
+        done
+      fi
+
+      echo "└──────────────────────────────────────────────────────────────────┘"
+
+      sleep "$refresh_rate"
+
+      # Check if collection is done
+      if grep -q '"status":"complete"' "$STATUS_JSON" 2>/dev/null; then
+        sleep 2
+        break
+      fi
+    done
+
+    tput rmcup 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+  ) &
+  DASHBOARD_PID=$!
+}
+
+# Web Dashboard HTTP Server
+start_web_dashboard() {
+  local port="$DASHBOARD_PORT"
+
+  # Create HTML dashboard
+  cat > "$OUTDIR/dashboard.html" <<'ENDHTML'
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sequoia Forensic - Live Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#0a0e14;color:#e6eef8;padding:20px}
+.container{max-width:1400px;margin:0 auto}
+h1{color:#6dc1ff;margin-bottom:20px;font-size:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:20px;margin-bottom:20px}
+.card{background:#0f1419;border:1px solid#1a2332;border-radius:8px;padding:16px}
+.card h2{color:#7cc4ff;font-size:18px;margin-bottom:12px}
+.progress-bar{background:#1a2332;height:30px;border-radius:6px;overflow:hidden;position:relative;margin:10px 0}
+.progress-fill{background:linear-gradient(90deg,#0a84ff 0%,#64d2ff 100%);height:100%;transition:width 0.3s ease}
+.progress-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:600;text-shadow:0 0 4px #000}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:12px}
+.stat-item{background:#1a2332;padding:12px;border-radius:6px}
+.stat-label{color:#9fb4d0;font-size:12px;margin-bottom:4px}
+.stat-value{color:#fff;font-size:24px;font-weight:600}
+.events{background:#0f1419;border:1px solid #1a2332;border-radius:8px;padding:16px;margin-top:20px}
+.event{padding:8px 0;border-bottom:1px solid #1a2332;font-family:monospace;font-size:13px}
+.event:last-child{border-bottom:none}
+.event .time{color:#5c7a99;margin-right:8px}
+.event .icon{margin-right:8px}
+.event.success .icon{color:#0f6}
+.event.warning .icon{color:#fc0}
+.event.error .icon{color:#f33}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}}
+</style>
+</head><body>
+<div class="container">
+<h1>🔍 Sequoia Forensic - Live Collection Dashboard</h1>
+<div class="grid">
+<div class="card">
+<h2>Overall Progress</h2>
+<div class="progress-bar">
+<div class="progress-fill" id="overall-fill" style="width:0%"></div>
+<div class="progress-text" id="overall-text">0%</div>
+</div>
+<p id="step-info" style="margin-top:12px;color:#9fb4d0">Initializing...</p>
+</div>
+<div class="card">
+<h2>Collection Statistics</h2>
+<div class="stats">
+<div class="stat-item">
+<div class="stat-label">Files Collected</div>
+<div class="stat-value" id="stat-files">0</div>
+</div>
+<div class="stat-item">
+<div class="stat-label">Total Size</div>
+<div class="stat-value" id="stat-size">0 MB</div>
+</div>
+<div class="stat-item">
+<div class="stat-label">Elapsed Time</div>
+<div class="stat-value" id="stat-time">00:00</div>
+</div>
+<div class="stat-item">
+<div class="stat-label">Status</div>
+<div class="stat-value pulse" id="stat-status">Running</div>
+</div>
+</div>
+</div>
+</div>
+<div class="events">
+<h2 style="margin-bottom:12px;color:#7cc4ff">Recent Events</h2>
+<div id="events-list"></div>
+</div>
+</div>
+<script>
+function updateDashboard(){
+fetch('dashboard_status.json?_='+ +new Date()).then(r=>r.json()).then(d=>{
+document.getElementById('overall-fill').style.width=d.overall_progress+'%';
+document.getElementById('overall-text').textContent=d.overall_progress+'% ('+d.current_step+'/'+d.total_steps+')';
+document.getElementById('step-info').textContent='Current: '+d.step_name;
+document.getElementById('stat-files').textContent=d.stats.files_collected.toLocaleString();
+document.getElementById('stat-size').textContent=Math.round(d.stats.total_size_bytes/1048576).toLocaleString()+' MB';
+let secs=d.stats.elapsed_seconds;
+let mins=Math.floor(secs/60);
+let hrs=Math.floor(mins/60);
+document.getElementById('stat-time').textContent=String(hrs).padStart(2,'0')+':'+String(mins%60).padStart(2,'0');
+document.getElementById('stat-status').textContent=d.status=='complete'?'Complete':'Running';
+}).catch(e=>console.error(e));
+fetch('dashboard_events.log?_='+ +new Date()).then(r=>r.text()).then(txt=>{
+let lines=txt.trim().split('\n').filter(l=>l).reverse().slice(0,10);
+let html=lines.map(line=>{
+let cls='info';
+if(line.includes('✓'))cls='success';
+if(line.includes('⚠'))cls='warning';
+if(line.includes('✗'))cls='error';
+return'<div class="event '+cls+'">'+line+'</div>';
+}).join('');
+document.getElementById('events-list').innerHTML=html;
+}).catch(e=>console.error(e));
+}
+updateDashboard();
+setInterval(updateDashboard,1000);
+</script>
+</body></html>
+ENDHTML
+
+  # Start simple HTTP server using Python
+  if command -v /usr/bin/python3 >/dev/null 2>&1; then
+    (cd "$OUTDIR" && /usr/bin/python3 -m http.server "$port" >/dev/null 2>&1) &
+    DASHBOARD_PID=$!
+    echo "[dashboard] Web dashboard started at http://localhost:$port/dashboard.html"
+    log_dashboard_event "info" "Web dashboard: http://localhost:$port/dashboard.html"
+  else
+    echo "[dashboard] Python3 required for web dashboard" >&2
+  fi
+}
+
+stop_dashboard() {
+  if [ -n "$DASHBOARD_PID" ]; then
+    kill "$DASHBOARD_PID" 2>/dev/null || true
+    wait "$DASHBOARD_PID" 2>/dev/null || true
+  fi
+  # Mark as complete
+  update_dashboard "status" "complete"
+}
 
 run_elev() {
   # usage: run_elev <desc> <cmd...>
@@ -263,21 +594,21 @@ capabilities_banner() {
   local sip="unknown"
   command -v csrutil >/dev/null 2>&1 && sip="$(csrutil status 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
 
-  # Presence toggles
-  local sudo_avail="no"; command -v sudo >/dev/null 2>&1 && sudo_avail="yes"
-  local ddrescue_avail="no"; command -v ddrescue >/dev/null 2>&1 && ddrescue_avail="yes"
-  local pv_avail="no"; command -v pv >/dev/null 2>&1 && pv_avail="yes"
-  local age_avail="no"; command -v age >/dev/null 2>&1 && age_avail="yes"
-  local gpg_avail="no"; command -v gpg >/dev/null 2>&1 && gpg_avail="yes"
-  local openssl_avail="no"; command -v openssl >/dev/null 2>&1 && openssl_avail="yes"
-  local praudit_avail="no"; command -v praudit >/dev/null 2>&1 && praudit_avail="yes"
-  local osquery_avail="no"; command -v osqueryi >/dev/null 2>&1 && osquery_avail="yes"
-  local rkhunter_avail="no"; command -v rkhunter >/dev/null 2>&1 && rkhunter_avail="yes"
-  local chkrootkit_avail="no"; command -v chkrootkit >/dev/null 2>&1 && chkrootkit_avail="yes"
-  local lsof_avail="no"; command -v lsof >/dev/null 2>&1 && lsof_avail="yes"
-  local pfctl_avail="no"; command -v pfctl >/dev/null 2>&1 && pfctl_avail="yes"
-  local log_avail="no"; command -v log >/dev/null 2>&1 && log_avail="yes"
-  local sysprof_avail="no"; command -v system_profiler >/dev/null 2>&1 && sysprof_avail="yes"
+  # Presence toggles (use cached values)
+  local sudo_avail="no"; has_tool sudo && sudo_avail="yes"
+  local ddrescue_avail="no"; has_tool ddrescue && ddrescue_avail="yes"
+  local pv_avail="no"; has_tool pv && pv_avail="yes"
+  local age_avail="no"; has_tool age && age_avail="yes"
+  local gpg_avail="no"; has_tool gpg && gpg_avail="yes"
+  local openssl_avail="no"; has_tool openssl && openssl_avail="yes"
+  local praudit_avail="no"; has_tool praudit && praudit_avail="yes"
+  local osquery_avail="no"; has_tool osqueryi && osquery_avail="yes"
+  local rkhunter_avail="no"; has_tool rkhunter && rkhunter_avail="yes"
+  local chkrootkit_avail="no"; has_tool chkrootkit && chkrootkit_avail="yes"
+  local lsof_avail="no"; has_tool lsof && lsof_avail="yes"
+  local pfctl_avail="no"; has_tool pfctl && pfctl_avail="yes"
+  local log_avail="no"; has_tool log && log_avail="yes"
+  local sysprof_avail="no"; has_tool system_profiler && sysprof_avail="yes"
 
   # FDA heuristic
   local fda="unknown"
@@ -447,6 +778,14 @@ run_step() {
   echo; echo "----------------------------------------------------------------"
   echo "STEP $RUN_COUNT: $label"
 
+  # Update dashboard
+  [ "$DASHBOARD_MODE" != "none" ] && {
+    update_dashboard "current_step" "$RUN_COUNT"
+    update_dashboard "step_name" "$label"
+    update_dashboard "overall_progress" "$((RUN_COUNT * 100 / ${#STEPS[@]}))"
+    log_dashboard_event "info" "Starting: $label"
+  }
+
   local start end dur rc
   start=$(date +%s)
 
@@ -465,10 +804,22 @@ run_step() {
 
   progress_print "$RUN_COUNT" "${#STEPS[@]}" "$TOTAL_ELAPSED"; echo
 
+  # Update dashboard with results
+  [ "$DASHBOARD_MODE" != "none" ] && {
+    update_dashboard "stats.elapsed_seconds" "$TOTAL_ELAPSED"
+    # Count files collected
+    local file_count=$(find "$OUTDIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+    local total_size=$(du -sk "$OUTDIR" 2>/dev/null | awk '{print $1*1024}' || echo 0)
+    update_dashboard "stats.files_collected" "$file_count"
+    update_dashboard "stats.total_size_bytes" "$total_size"
+  }
+
   if [ $rc -ne 0 ]; then
     echo "WARN: $label completed with non-zero status ($rc) after ${dur}s — continuing."
+    [ "$DASHBOARD_MODE" != "none" ] && log_dashboard_event "warning" "$label completed with errors (${dur}s)"
   else
     echo "DONE: $label (${dur}s)"
+    [ "$DASHBOARD_MODE" != "none" ] && log_dashboard_event "success" "$label completed (${dur}s)"
   fi
 }
 
@@ -553,12 +904,13 @@ image_and_hash() {
   local MAP="$OUTDIR/image/$(basename "$IMAGE_DEV").map"
 
   echo "[acquire] Imaging $DEV_RAW -> $IMG"
-  if command -v ddrescue >/dev/null 2>&1; then
+  if has_tool ddrescue; then
     run_elev "ddrescue imaging" ddrescue -f -n "$DEV_RAW" "$IMG" "$MAP" 2>&1 | tee "$OUTDIR/image/ddrescue_progress.txt" || true
     run_elev "ddrescue retry"   ddrescue -f -r2 "$DEV_RAW" "$IMG" "$MAP" 2>&1 | tee -a "$OUTDIR/image/ddrescue_progress.txt" || true
   else
-    if command -v pv >/dev/null 2>&1; then
-      run_elev "pv|dd imaging" sh -c "pv '$DEV_RAW' | dd of='$IMG' bs=1m" 2> "$OUTDIR/image/dd_progress.txt" || true
+    if has_tool pv; then
+      # Fix: Use proper argument passing to avoid shell injection
+      run_elev "pv|dd imaging" sh -c 'pv "$1" | dd of="$2" bs=1m' _ "$DEV_RAW" "$IMG" 2> "$OUTDIR/image/dd_progress.txt" || true
     else
       run_elev "dd imaging" dd if="$DEV_RAW" of="$IMG" bs=1m 2> "$OUTDIR/image/dd_progress.txt" || true
     fi
@@ -566,8 +918,15 @@ image_and_hash() {
 
   echo "[acquire] Hashing (SHA-256)…"
   local sha=""
-  if command -v shasum >/dev/null 2>&1; then sha=$(shasum -a 256 "$IMG" | awk '{print $1}')
-  elif command -v sha256sum >/dev/null 2>&1; then sha=$(sha256sum "$IMG" | awk '{print $1}')
+  if has_tool pv && has_tool shasum; then
+    # Hash with progress display
+    sha=$(pv "$IMG" | shasum -a 256 | awk '{print $1}')
+  elif has_tool pv && has_tool sha256sum; then
+    sha=$(pv "$IMG" | sha256sum | awk '{print $1}')
+  elif has_tool shasum; then
+    sha=$(shasum -a 256 "$IMG" | awk '{print $1}')
+  elif has_tool sha256sum; then
+    sha=$(sha256sum "$IMG" | awk '{print $1}')
   fi
   [ -n "$sha" ] && echo "$sha  $IMG" > "$HASHFILE" && coc_update_hash "$sha"
 
@@ -643,13 +1002,14 @@ collect_unified_logs() {
   fi
   local to=$([ "$FAST_MODE" = true ] && echo 60 || echo "$LOG_PLAIN_TIMEOUT")
 
-  if [ "$ROOT" = "/" ] && command -v log >/dev/null 2>&1; then
+  if [ "$ROOT" = "/" ] && has_tool log; then
     echo "[logs] collecting archive (offline-ready)…"
     run_elev "unified log collect" log collect --output "$OUTDIR/system_logs.logarchive" --last "$SINCE" || note_skip "log collect (archive)"
 
-    echo "[logs] plaintext quick-view ($plain_since, ${to}s timeout)…"
+    echo "[logs] plaintext quick-view ($plain_since, ${to}s timeout, max 500k lines)…"
     local PLAIN="$OUTDIR/unified_log_raw.txt"; local ERRZ="$OUTDIR/unified_log_raw.stderr"
-    if run_with_timeout "$to" log show --style syslog --last "$plain_since" --info --debug --no-pager > "$PLAIN" 2> "$ERRZ"; then
+    # Limit output to 500k lines to prevent multi-GB files
+    if run_with_timeout "$to" sh -c "log show --style syslog --last '$plain_since' --info --debug --no-pager | head -n 500000" > "$PLAIN" 2> "$ERRZ"; then
       : # ok
     else
       local rc=$?
@@ -733,7 +1093,7 @@ collect_audit_logs() {
     while IFS= read -r -d '' f; do
       local bn; bn=$(basename "$f")
       cp -a "$f" "$OUTDIR/audit/" 2>/dev/null || run_elev "copy audit $bn" cp -a "$f" "$OUTDIR/audit/" || { note_skip "audit: $bn"; continue; }
-      if command -v praudit >/dev/null 2>&1; then
+      if has_tool praudit; then
         if [ "$count" -lt "$decode_limit" ]; then
           ( praudit "$f" > "$OUTDIR/audit/$bn.txt" 2>/dev/null || true )
           count=$((count+1))
@@ -747,7 +1107,7 @@ collect_audit_logs() {
 
 collect_usb_and_mounts() {
   cp -a "$(rpath /var/log/system.log)" "$OUTDIR/var_log_system.log" 2>/dev/null || true
-  if [ "$ROOT" = "/" ] && command -v system_profiler >/dev/null 2>&1; then
+  if [ "$ROOT" = "/" ] && has_tool system_profiler; then
     system_profiler SPUSBDataType > "$OUTDIR/system_profiler_SPUSB.txt" 2>/dev/null || true
     system_profiler SPNVMeDataType > "$OUTDIR/system_profiler_SPNVMe.txt" 2>/dev/null || true
   fi
@@ -755,9 +1115,9 @@ collect_usb_and_mounts() {
 
 collect_network_state() {
   netstat -an > "$OUTDIR/netstat_all.txt" 2>/dev/null || true
-  command -v pfctl >/dev/null 2>&1 && pfctl -s state > "$OUTDIR/pf_state.txt" 2>/dev/null || true
+  has_tool pfctl && pfctl -s state > "$OUTDIR/pf_state.txt" 2>/dev/null || true
   # lsof can be heavy; restrict in FAST mode
-  if command -v lsof >/dev/null 2>&1; then
+  if has_tool lsof; then
     if [ "$FAST_MODE" = true ]; then
       lsof -nP -iTCP -sTCP:LISTEN > "$OUTDIR/lsof_net.txt" 2>/dev/null || true
     else
@@ -769,18 +1129,25 @@ collect_network_state() {
 find_recent_files() {
   echo "Enumerating files modified since reference (bounded)…"
   local out="$OUTDIR/find_modified.txt"
+
+  # Build prune list
+  local prune_paths="-path ${ROOT}/dev -prune -o -path ${ROOT}/proc -prune -o -path ${ROOT}/sys -prune -o -path ${ROOT}/Volumes -prune"
+  [ "$INCLUDE_SYSTEM" = false ] && prune_paths="$prune_paths -o -path ${ROOT}/System -prune"
+
+  # Use ionice if available to reduce I/O impact
+  local nice_cmd=""
+  has_tool ionice && nice_cmd="ionice -c 3"
+
   # prune common heavy trees; add -xdev to avoid crossing devices (FAST)
   if [ "$FAST_MODE" = true ]; then
-    find "${ROOT}" -xdev \
-      -path "${ROOT}/dev" -prune -o -path "${ROOT}/proc" -prune -o -path "${ROOT}/sys" -prune -o \
-      -path "${ROOT}/Volumes" -prune -o \
+    $nice_cmd find "${ROOT}" -xdev \
+      $prune_paths -o \
       -type f -newer "$REF_FILE" -print 2>/dev/null > "$out" || true
   else
-    find "${ROOT}" \
-      -path "${ROOT}/dev" -prune -o -path "${ROOT}/proc" -prune -o -path "${ROOT}/sys" -prune -o \
+    $nice_cmd find "${ROOT}" \
+      $prune_paths -o \
       -type f -newer "$REF_FILE" -print 2>/dev/null > "$out" || true
   fi
-  if [ "$INCLUDE_SYSTEM" = false ]; then sed -i '' '/\/System\//d' "$out" 2>/dev/null || true; fi
 }
 
 collect_user_metadata() {
@@ -818,38 +1185,73 @@ suspicious_procs() {
   awk '$11 ~ /^\/tmp/ || $11 ~ /^\/var\/tmp/ {print $0}' \
     "$OUTDIR/suspicious/ps_aux.txt" > "$OUTDIR/suspicious/from_tmp.txt" 2>/dev/null || true
 
-  # Unsigned processes (bounded in FAST mode)
+  # Unsigned processes (OPTIMIZED: batch lsof calls)
   : > "$OUTDIR/suspicious/unsigned_procs.txt"
 
-  if [ "$FAST_MODE" = true ]; then
+  if ! has_tool lsof; then
+    echo "[suspicious] lsof not available, skipping unsigned process check" > "$OUTDIR/suspicious/unsigned_procs.txt"
+  elif [ "$FAST_MODE" = true ]; then
     # Only check PIDs that are listening or connected (smaller set)
     if [ -f "$OUTDIR/lsof_net.txt" ]; then
-      awk 'NR>1 {print $2}' "$OUTDIR/lsof_net.txt" 2>/dev/null | sort -u | while read -r pid; do
-        [ -z "$pid" ] && continue
-        # Best-effort path detection
-        procpath="$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n1)"
-        [ -z "$procpath" ] && continue
-        [ ! -f "$procpath" ] && continue
-        # codesign non-zero is "unsigned" — record it, but never fail the step
-        codesign -v "$procpath" >/dev/null 2>&1
-        [ $? -ne 0 ] && echo "PID:$pid PATH:$procpath" >> "$OUTDIR/suspicious/unsigned_procs.txt"
-      done
+      local pids=$(awk 'NR>1 {print $2}' "$OUTDIR/lsof_net.txt" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+      [ -n "$pids" ] && {
+        # Single batched lsof call for all network PIDs
+        lsof -F n -p "$pids" 2>/dev/null | while IFS= read -r line; do
+          if [[ "$line" =~ ^p([0-9]+)$ ]]; then
+            current_pid="${BASH_REMATCH[1]}"
+          elif [[ "$line" =~ ^n(.+)$ ]]; then
+            procpath="${BASH_REMATCH[1]}"
+            [ -f "$procpath" ] && {
+              codesign -v "$procpath" >/dev/null 2>&1
+              [ $? -ne 0 ] && echo "PID:$current_pid PATH:$procpath" >> "$OUTDIR/suspicious/unsigned_procs.txt"
+            }
+            current_pid="" # Reset after processing
+          fi
+        done
+      }
     fi
   else
-    # Full sweep — still protected against transient failures
-    while read -r line; do
-      pid=$(echo "$line" | awk '{print $2}')
-      [ -z "$pid" ] && continue
-      procpath="$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -n1)"
-      if [ -z "$procpath" ]; then
-        # fallback: first token of COMMAND column
-        procpath=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf $i " "; print ""}' | awk '{print $1}')
+    # Full sweep with batched lsof (process in batches of 100 PIDs)
+    local pids_batch="" batch_count=0
+    awk 'NR>1 {print $2}' "$OUTDIR/suspicious/ps_aux.txt" 2>/dev/null | while read -r pid; do
+      [ -z "$pid" ] || [[ ! "$pid" =~ ^[0-9]+$ ]] && continue
+
+      pids_batch="${pids_batch}${pids_batch:+,}${pid}"
+      batch_count=$((batch_count + 1))
+
+      # Process batch every 100 PIDs or at end
+      if [ "$batch_count" -ge 100 ]; then
+        lsof -F n -p "$pids_batch" 2>/dev/null | while IFS= read -r line; do
+          if [[ "$line" =~ ^p([0-9]+)$ ]]; then
+            current_pid="${BASH_REMATCH[1]}"
+          elif [[ "$line" =~ ^n(.+)$ ]]; then
+            procpath="${BASH_REMATCH[1]}"
+            [ -f "$procpath" ] && {
+              codesign -v "$procpath" >/dev/null 2>&1
+              [ $? -ne 0 ] && echo "PID:$current_pid PATH:$procpath" >> "$OUTDIR/suspicious/unsigned_procs.txt"
+            }
+            current_pid=""
+          fi
+        done
+        pids_batch=""
+        batch_count=0
       fi
-      [ -z "$procpath" ] && continue
-      [ ! -f "$procpath" ] && continue
-      codesign -v "$procpath" >/dev/null 2>&1
-      [ $? -ne 0 ] && echo "PID:$pid PATH:$procpath" >> "$OUTDIR/suspicious/unsigned_procs.txt"
-    done < "$OUTDIR/suspicious/ps_aux.txt"
+    done
+    # Process remaining PIDs
+    [ -n "$pids_batch" ] && {
+      lsof -F n -p "$pids_batch" 2>/dev/null | while IFS= read -r line; do
+        if [[ "$line" =~ ^p([0-9]+)$ ]]; then
+          current_pid="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^n(.+)$ ]]; then
+          procpath="${BASH_REMATCH[1]}"
+          [ -f "$procpath" ] && {
+            codesign -v "$procpath" >/dev/null 2>&1
+            [ $? -ne 0 ] && echo "PID:$current_pid PATH:$procpath" >> "$OUTDIR/suspicious/unsigned_procs.txt"
+          }
+          current_pid=""
+        fi
+      done
+    }
   fi
 
   # Names that hint at reverse shells/listeners — allow "no matches" without failing
@@ -883,13 +1285,34 @@ cron_and_launchd_check() {
 
 sudo_activity() {
   mkdir -p "$OUTDIR/sudo"
-  if command -v log >/dev/null 2>&1; then
+  if has_tool log; then
     # smaller window in FAST mode
     local sw="$([ "$FAST_MODE" = true ] && echo "24h" || echo "$SINCE")"
     log show --style syslog --last "$sw" --predicate 'process == "sudo"' > "$OUTDIR/sudo/sudo_recent.txt" 2>/dev/null || true
   else
     echo "log(1) unavailable" > "$OUTDIR/sudo/README.txt"
   fi
+}
+
+# -----------------------
+# Artifact Integrity Manifest
+# -----------------------
+generate_manifest() {
+  echo "[manifest] Generating artifact integrity manifest…"
+  local manifest="$OUTDIR/manifest.sha256"
+
+  if has_tool shasum; then
+    find "$OUTDIR" -type f ! -name "manifest.sha256" ! -name "*.log" -exec shasum -a 256 {} \; > "$manifest" 2>/dev/null || true
+  elif has_tool sha256sum; then
+    find "$OUTDIR" -type f ! -name "manifest.sha256" ! -name "*.log" -exec sha256sum {} \; > "$manifest" 2>/dev/null || true
+  else
+    echo "[manifest] No hashing tool available (shasum/sha256sum)" > "$manifest"
+    return 0
+  fi
+
+  local count=$(wc -l < "$manifest" | tr -d ' ')
+  echo "[manifest] Hashed $count artifacts for chain-of-custody verification"
+  echo "[manifest] Manifest: $manifest"
 }
 
 # -----------------------
@@ -918,6 +1341,7 @@ build_html_report() {
   echo '  <li><a href="./scheduled/launchd_plists.txt">LaunchDaemons/Agents</a></li>'
   echo '  <li><a href="./sudo/sudo_recent.txt">Recent sudo activity</a></li>'
   [ -f "$SKIPS_FILE" ] && echo '  <li><a href="./permission_skips.txt">Permission-related skips</a></li>'
+  [ -f "$OUTDIR/manifest.sha256" ] && echo '  <li><a href="./manifest.sha256">Artifact integrity manifest (SHA-256)</a></li>'
   echo '</ul></div>'
   env_card_html
   echo '<div class="card"><h2>Quick Findings</h2>'
@@ -946,8 +1370,8 @@ encrypt_artifact() {
   [ -z "${ENCRYPT_PUBKEY:-}" ] && return 0
   local m="$ENCRYPT_METHOD"
   if [ "$m" = "auto" ]; then
-    if command -v age >/dev/null 2>&1; then m="age"
-    elif command -v gpg >/dev/null 2>&1; then m="gpg"
+    if has_tool age; then m="age"
+    elif has_tool gpg; then m="gpg"
     else m="openssl"; fi
   fi
   echo "[encrypt] Method: $m"
@@ -969,21 +1393,38 @@ encrypt_artifact() {
       -K "$(xxd -p "$dek" | tr -d '\n')" -iv "$(xxd -p "$iv" | tr -d '\n')" -S 0000000000000000 -p >/dev/null 2>&1 || true
     openssl pkeyutl -encrypt -pubin -inkey "$ENCRYPT_PUBKEY" -in "$dek" -out "${ENCRYPTED_FILE}.key" >/dev/null 2>&1
     cp "$iv" "${ENCRYPTED_FILE}.iv"
-    rm -f "$dek" "$iv"
+
+    # Secure deletion of temporary keys
+    if has_tool srm; then
+      srm -f "$dek" "$iv" 2>/dev/null || true
+    else
+      # Overwrite with random data before deletion
+      dd if=/dev/urandom of="$dek" bs=32 count=1 conv=notrunc 2>/dev/null || true
+      dd if=/dev/urandom of="$iv" bs=12 count=1 conv=notrunc 2>/dev/null || true
+      rm -f "$dek" "$iv"
+    fi
     echo "[encrypt] Wrote $ENCRYPTED_FILE (+ .key, .iv)"; return 0
   fi
 }
 discord_upload() {
   local file_to_send="$1"
   [ -z "${DISCORD_WEBHOOK:-}" ] && return 0
-  local payload='{"content":"Sequoia forensic collection","embeds":[{"title":"Artifacts","description":"Attached file (sensitive)."}]}'
-  echo "Uploading to Discord…"
+
+  # SECURITY: Require encryption for Discord uploads (sensitive forensic data)
+  if [[ "$file_to_send" != *.age && "$file_to_send" != *.gpg && "$file_to_send" != *.enc ]]; then
+    echo "[security] Discord uploads require encryption. Use --encrypt age:key.pub or similar." >&2
+    echo "[security] Upload cancelled to prevent leaking sensitive forensic data." >&2
+    return 1
+  fi
+
+  local payload='{"content":"Sequoia forensic collection (encrypted)","embeds":[{"title":"Artifacts","description":"Attached encrypted file."}]}'
+  echo "Uploading encrypted file to Discord…"
   curl -s -X POST "$DISCORD_WEBHOOK" \
       -F "payload_json=$payload" \
       -F "file=@${file_to_send}" \
       -o "$OUTDIR/discord_upload_status.txt" -w "%{http_code}\n" || true
   echo "Discord status: $(tail -n1 "$OUTDIR/discord_upload_status.txt")"
-  coc_add_transfer "system" "Uploaded via webhook"
+  coc_add_transfer "system" "Uploaded via webhook (encrypted)"
 }
 
 # -----------------------
@@ -1004,6 +1445,7 @@ STEPS=(
   "Suspicious processes"
   "Cron & launchd inspection"
   "Sudo activity"
+  "Generate artifact manifest"
   "Build HTML report"
   "Package / Encrypt / Upload"
 )
@@ -1022,13 +1464,72 @@ FUNCS=(
   "suspicious_procs"
   "cron_and_launchd_check"
   "sudo_activity"
+  "generate_manifest"
   "build_html_report"
   ":" # handled specially
 )
 
 $FORENSIC_MODE && echo "[mode] Forensic mode ON: acquisition occurs before analysis."
 
-for i in "${!STEPS[@]}"; do
+# -----------------------
+# Dashboard Initialization
+# -----------------------
+if [ "$DASHBOARD_MODE" != "none" ]; then
+  echo "[dashboard] Initializing $DASHBOARD_MODE dashboard..."
+  init_dashboard_status
+
+  case "$DASHBOARD_MODE" in
+    tui)
+      start_tui_dashboard
+      ;;
+    web)
+      start_web_dashboard
+      ;;
+    both)
+      start_tui_dashboard
+      DASHBOARD_TUI_PID=$DASHBOARD_PID
+      start_web_dashboard
+      DASHBOARD_WEB_PID=$DASHBOARD_PID
+      ;;
+  esac
+fi
+
+# Parallel execution groups (indices that can run together)
+PARALLEL_GROUP_1=(1 2 3)    # System snapshot, key files, login activity
+PARALLEL_GROUP_2=(7 8 9 10) # USB/mounts, network, recent files, user metadata
+
+run_parallel_group() {
+  local -a indices=("$@")
+  local -a pids=()
+
+  echo; echo "Running ${#indices[@]} steps in parallel…"
+
+  for idx in "${indices[@]}"; do
+    label="${STEPS[$idx]}"; func="${FUNCS[$idx]}"
+    (run_step "$label" "$func") &
+    pids+=($!)
+  done
+
+  # Wait for all background jobs
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+}
+
+i=0
+while [ $i -lt ${#STEPS[@]} ]; do
+  # Check if this is the start of a parallel group
+  if [[ " ${PARALLEL_GROUP_1[@]} " =~ " $i " ]]; then
+    run_parallel_group "${PARALLEL_GROUP_1[@]}"
+    i=$((i + ${#PARALLEL_GROUP_1[@]}))
+    continue
+  elif [[ " ${PARALLEL_GROUP_2[@]} " =~ " $i " ]]; then
+    run_parallel_group "${PARALLEL_GROUP_2[@]}"
+    i=$((i + ${#PARALLEL_GROUP_2[@]}))
+    continue
+  fi
+
+  # Regular sequential execution
   label="${STEPS[$i]}"; func="${FUNCS[$i]}"
   if $FORENSIC_MODE && ! $NO_IMAGE_OK && [ "$label" != "Disk imaging + hashing" ]; then
     $IMAGING_DONE || { echo "[guard] Acquisition not complete; re-run with --image <dev> or --no-image-ok."; exit 3; }
@@ -1041,6 +1542,7 @@ for i in "${!STEPS[@]}"; do
   else
     run_step "$label" "$func"
   fi
+  i=$((i + 1))
 done
 
 # Pretty elapsed time at the end
@@ -1054,4 +1556,16 @@ echo "[done] Log: $LOG"
 echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RUN_STATUS"
 echo "script_version=$SCRIPT_VERSION"            >> "$RUN_STATUS"
 echo "exit_code=0"                               >> "$RUN_STATUS"
+
+# -----------------------
+# Dashboard Cleanup
+# -----------------------
+if [ "$DASHBOARD_MODE" != "none" ]; then
+  log_dashboard_event "success" "Collection complete!"
+  update_dashboard "status" "complete"
+  update_dashboard "overall_progress" "100"
+  echo "[dashboard] Collection complete. Dashboard will close in 3 seconds..."
+  sleep 3
+  stop_dashboard
+fi
 
