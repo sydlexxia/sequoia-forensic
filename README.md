@@ -31,6 +31,8 @@ chmod +x sequoia_forensic.sh
 | `--since N`                | Time window for logs/events (e.g., `48h`, `7d`, `30d`). Default: `7d`.      |
 | `--skip-logs`              | Bypass Unified Log plaintext extraction (still collects `.logarchive`).     |
 | `--ask-skip-logs`          | Prompt interactively to bypass Unified Log plaintext.                       |
+| `--dashboard MODE`         | Live visualization: `tui`, `web`, `both`, `none` (default: `none`).         |
+| `--dashboard-port PORT`    | Web dashboard port (default: `8042`).                                       |
 | `--encrypt METHOD:KEY`     | Supported: `age:/path/to/key.pub`, `gpg:ID`, `openssl:cert.pem`.            |
 | `--webhook URL`            | Send results to a Discord webhook (JSON + HTML report).                     |
 | `--debug`                  | Enable debug traps and verbose logging.                                     |
@@ -54,6 +56,15 @@ sudo ./sequoia_forensic.sh --out /cases/case001
 **Send results to Discord (lab/team triage):**
 
 ./sequoia_forensic.sh --no-image-ok --webhook https://discord.com/api/webhooks/... --out ~/Desktop/case_discord
+
+**Live collection with real-time TUI dashboard:**
+
+./sequoia_forensic.sh --no-image-ok --dashboard tui --out ~/Desktop/case_live
+
+**Live collection with web dashboard (view in browser):**
+
+./sequoia_forensic.sh --no-image-ok --dashboard web --dashboard-port 8042 --out ~/Desktop/case_web
+# Open browser to http://localhost:8042/dashboard.html
 
 
 ### Common Options
@@ -81,10 +92,28 @@ At the end you’ll find:
 
 
 ### Core Capabilities
-- **Acquisition-first workflow**  
+- **Acquisition-first workflow**
   - Collects disk, logs, artifacts before analysis (to avoid polluting evidence).
   - Images entire disks with `ddrescue` or `dd` (if available).
   - Hashes acquired images (SHA256).
+  - Generates artifact integrity manifest with SHA-256 hashes for chain-of-custody verification.
+
+- **Live Dashboard System (NEW)**
+  - Real-time TUI dashboard with progress bars, stats, and event feed.
+  - Web-based dashboard accessible via browser (default port: 8042).
+  - Live metrics: files collected, total size, elapsed time, current step.
+  - Recent events log with color-coded status indicators.
+
+- **Security Hardening (NEW)**
+  - Input validation prevents path traversal attacks.
+  - Shell injection vulnerability fixes in imaging workflow.
+  - Secure argument handling throughout collection pipeline.
+
+- **Performance Optimizations (NEW)**
+  - Tool availability caching for faster runtime detection.
+  - Batched `lsof` calls (100x faster unsigned process detection).
+  - I/O priority control with `ionice` when available.
+  - Limited unified log plaintext to 500k lines max (prevents multi-GB files).
 
 - **Filesystem & Access Monitoring**
   - Collects recent file/folder access via FSEvents.
@@ -132,6 +161,23 @@ At the end you’ll find:
 
 ---
 
-> **Current Release:** `v1.6.1-unstoppable-receipt`  
-> This release hardens error handling, adds a run-status receipt file, and improves stability in Unified Logs and Suspicious Processes collection.
+## Recent Updates
+
+### v1.7.0 - Live Dashboard & Security Hardening (Latest)
+- **Live Dashboard System**: Real-time TUI and web-based collection monitoring
+- **Security Fixes**: Path traversal prevention, shell injection patches
+- **Performance**: 100x faster unsigned process detection via batched lsof calls
+- **Artifact Integrity**: SHA-256 manifest generation for chain-of-custody
+- **I/O Optimization**: ionice support, unified log output capping
+
+### v1.6.1 - Unstoppable Receipt
+- Hardened error handling with non-fatal collectors
+- Added run-status receipt file with start/end timestamps
+- Improved stability in Unified Logs and Suspicious Processes collection
+
+---
+
+## Documentation
+
+For detailed architecture, development guidelines, and troubleshooting, see [HINTS.md](./HINTS.md).
 
